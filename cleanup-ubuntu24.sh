@@ -31,9 +31,8 @@ REBOOT_AT_END="${REBOOT_AT_END:-0}"
 
 # Serwery NTP z argumentow + zawsze dodajemy 2 awaryjne GUM
 NTP_FALLBACK=("tempus1.gum.gov.pl" "tempus2.gum.gov.pl")
-NTP_EXTRA=("$@")
 NTP_SERVERS=()
-for s in "${NTP_EXTRA[@]+${NTP_EXTRA[@]}}" "${NTP_FALLBACK[@]}"; do
+for s in "$@" "${NTP_FALLBACK[@]}"; do
   NTP_SERVERS+=("$s")
 done
 # usuniecie duplikatow z zachowaniem kolejnosci
@@ -41,18 +40,27 @@ mapfile -t NTP_SERVERS < <(printf '%s\n' "${NTP_SERVERS[@]}" | awk '!seen[$0]++'
 
 BACKUP_DIR="/root/netplan-backup-$(date +%F-%H%M%S)"
 
+# Wyciaga TYLKO nazwy interfejsow sieciowych z "netplan get network.ethernets".
+# Interfejsy to linie z pojedynczym tokenem pasujacym do typowych nazw kart
+# (en*, eth*, ens*, enp*, eno*, bond*, itp.) na poziomie wcięcia 2 spacji.
+# Klucze YAML jak dhcp6, accept-ra, addresses sa zaglebione glebiej lub
+# nie pasuja do wzorca nazwy interfejsu.
 detect_ifaces_from_netplan() {
   if ! command -v netplan >/dev/null 2>&1; then
     return 0
   fi
 
   netplan get network.ethernets 2>/dev/null \
-    | awk -F: '
-        /^[[:space:]]+[A-Za-z0-9_.:-]+:/ {
-          key=$1
-          gsub(/^[[:space:]]+/, "", key)
-          gsub(/[[:space:]]+$/, "", key)
-          if (key != "") print key
+    | awk '
+        # Linia z dokladnie 2 spacjami wciecia + nazwa + dwukropek
+        /^  [A-Za-z][A-Za-z0-9._-]+:/ {
+          iface = $0
+          gsub(/^[[:space:]]+/, "", iface)
+          gsub(/:.*$/, "", iface)
+          # Odrzuc typowe klucze YAML ktore nie sa nazwami interfejsow
+          if (iface !~ /^(dhcp4|dhcp6|accept-ra|addresses|routes|nameservers|link-local|gateway4|gateway6|mtu|match|set-name|wakeonlan|optional|renderer|version|ethernets|wifis|bridges|bonds|vlans|tunnels|vrfs)$/) {
+            print iface
+          }
         }
       ' \
     | sort -u
@@ -127,13 +135,11 @@ if [[ "${SET_TIMEZONE}" == "1" ]]; then
   echo "Strefa czasowa: $(timedatectl show -p Timezone --value)"
 
   log "Ustawianie formatu czasu 24h (locale)"
-  # LC_TIME=pl_PL.UTF-8 wymusza 24h w aplikacjach respektujacych locale
   if ! locale -a 2>/dev/null | grep -q 'pl_PL.utf8'; then
     apt -y install language-pack-pl >/dev/null 2>&1 || true
   fi
   update-locale LC_TIME=pl_PL.UTF-8
 
-  # Dla GTK/GNOME i innych ustawiamy globalnie
   if [[ -f /etc/default/locale ]]; then
     if ! grep -q 'LC_TIME' /etc/default/locale; then
       echo 'LC_TIME=pl_PL.UTF-8' >> /etc/default/locale
@@ -148,7 +154,6 @@ if [[ "${SET_NTP}" == "1" ]]; then
   log "Konfiguracja NTP (timesyncd)"
   printf 'Serwery NTP: %s\n' "${NTP_SERVERS[*]}"
 
-  # Upewnij sie ze systemd-timesyncd jest zainstalowany
   if ! command -v timedatectl >/dev/null 2>&1; then
     apt -y install systemd-timesyncd
   fi
@@ -156,8 +161,6 @@ if [[ "${SET_NTP}" == "1" ]]; then
   TIMESYNCD_CONF="/etc/systemd/timesyncd.conf.d/99-custom-ntp.conf"
   mkdir -p "$(dirname "${TIMESYNCD_CONF}")"
 
-  NTP_LINE=$(printf '%s ' "${NTP_SERVERS[@]}" | sed 's/ $//')
-  # Pierwsze 2 (lub mniej jesli tylko fallback) jako NTP, reszta jako FallbackNTP
   PRIMARY_NTP=()
   FALLBACK_NTP=()
   for idx in "${!NTP_SERVERS[@]}"; do
@@ -185,7 +188,6 @@ if [[ "${SET_NTP}" == "1" ]]; then
   systemctl enable --now systemd-timesyncd
   systemctl restart systemd-timesyncd
 
-  # Wylacz ntpd/chrony jesli dzialaly (konflikt z timesyncd)
   for svc in ntp chrony chronyd; do
     if systemctl is-active --quiet "$svc" 2>/dev/null; then
       log "Zatrzymywanie konkurencyjnej uslugi NTP: $svc"
@@ -193,7 +195,6 @@ if [[ "${SET_NTP}" == "1" ]]; then
     fi
   done
 
-  # Wlacz synchronizacje przez timedatectl
   timedatectl set-ntp true
 
   log "Weryfikacja synchronizacji NTP (czekam maks. 30s)"
@@ -269,7 +270,8 @@ if [[ "${DISABLE_IPV6}" == "1" ]]; then
   chmod 600 /etc/netplan/99-disable-ipv6.yaml
 
   log "Stosowanie sysctl"
-  sysctl -p /etc/sysctl.d/99-disable-ipv6.conf
+  # || true - bledy dla nieistniejacych pseudointerfejsow nie przerywaja skryptu
+  sysctl -p /etc/sysctl.d/99-disable-ipv6.conf || true
 
   if command -v netplan >/dev/null 2>&1; then
     log "netplan generate"
@@ -284,7 +286,8 @@ if [[ "${DISABLE_IPV6}" == "1" ]]; then
   log "Weryfikacja IPv6"
   echo "all.disable_ipv6=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || true)"
   for i in "${IFACES[@]}"; do
-    echo "${i}.disable_ipv6=$(cat /proc/sys/net/ipv6/conf/${i}/disable_ipv6 2>/dev/null || true)"
+    val=$(cat "/proc/sys/net/ipv6/conf/${i}/disable_ipv6" 2>/dev/null || echo "n/a")
+    echo "${i}.disable_ipv6=${val}"
   done
   ip -6 a || true
 fi
