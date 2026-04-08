@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# ---------------------------------------------------------------------------
+# Uzycie:
+#   sudo bash cleanup-ubuntu24.sh
+#   sudo bash cleanup-ubuntu24.sh ntp1.example.com ntp2.example.com
+#
+# Dodatkowe serwery NTP podajemy jako argumenty pozycyjne.
+# Zawsze dolaczane sa awaryjne: tempus1.gum.gov.pl i tempus2.gum.gov.pl
+# ---------------------------------------------------------------------------
+
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Uruchom jako root, np.: sudo bash $0"
   exit 1
@@ -16,7 +25,19 @@ PURGE_CLOUD_INIT="${PURGE_CLOUD_INIT:-0}"
 DISABLE_PRO_SERVICES="${DISABLE_PRO_SERVICES:-1}"
 DETACH_UBUNTU_PRO="${DETACH_UBUNTU_PRO:-1}"
 DISABLE_IPV6="${DISABLE_IPV6:-1}"
+SET_TIMEZONE="${SET_TIMEZONE:-1}"
+SET_NTP="${SET_NTP:-1}"
 REBOOT_AT_END="${REBOOT_AT_END:-0}"
+
+# Serwery NTP z argumentow + zawsze dodajemy 2 awaryjne GUM
+NTP_FALLBACK=("tempus1.gum.gov.pl" "tempus2.gum.gov.pl")
+NTP_EXTRA=("$@")
+NTP_SERVERS=()
+for s in "${NTP_EXTRA[@]+${NTP_EXTRA[@]}}" "${NTP_FALLBACK[@]}"; do
+  NTP_SERVERS+=("$s")
+done
+# usuniecie duplikatow z zachowaniem kolejnosci
+mapfile -t NTP_SERVERS < <(printf '%s\n' "${NTP_SERVERS[@]}" | awk '!seen[$0]++')
 
 BACKUP_DIR="/root/netplan-backup-$(date +%F-%H%M%S)"
 
@@ -55,6 +76,7 @@ detect_ifaces_from_system() {
   printf '%s\n' "${ifaces[@]}" | awk 'NF' | sort -u
 }
 
+# ---------------------------------------------------------------------------
 log "APT cleanup"
 apt -y autoremove --purge
 apt -y autoclean
@@ -68,6 +90,7 @@ else
   echo "Brak pakietow w stanie rc"
 fi
 
+# ---------------------------------------------------------------------------
 if [[ "${DISABLE_CLOUD_INIT}" == "1" ]]; then
   log "Wylaczanie cloud-init przez marker file"
   mkdir -p /etc/cloud
@@ -80,6 +103,7 @@ if [[ "${PURGE_CLOUD_INIT}" == "1" ]]; then
   rm -rf /etc/cloud /var/lib/cloud
 fi
 
+# ---------------------------------------------------------------------------
 if command -v pro >/dev/null 2>&1; then
   if [[ "${DISABLE_PRO_SERVICES}" == "1" ]]; then
     log "Wylaczanie popularnych uslug Ubuntu Pro"
@@ -96,6 +120,107 @@ else
   log "Polecenie 'pro' nie jest dostepne - pomijam Ubuntu Pro"
 fi
 
+# ---------------------------------------------------------------------------
+if [[ "${SET_TIMEZONE}" == "1" ]]; then
+  log "Ustawianie strefy czasowej na Europe/Warsaw"
+  timedatectl set-timezone Europe/Warsaw
+  echo "Strefa czasowa: $(timedatectl show -p Timezone --value)"
+
+  log "Ustawianie formatu czasu 24h (locale)"
+  # LC_TIME=pl_PL.UTF-8 wymusza 24h w aplikacjach respektujacych locale
+  if ! locale -a 2>/dev/null | grep -q 'pl_PL.utf8'; then
+    apt -y install language-pack-pl >/dev/null 2>&1 || true
+  fi
+  update-locale LC_TIME=pl_PL.UTF-8
+
+  # Dla GTK/GNOME i innych ustawiamy globalnie
+  if [[ -f /etc/default/locale ]]; then
+    if ! grep -q 'LC_TIME' /etc/default/locale; then
+      echo 'LC_TIME=pl_PL.UTF-8' >> /etc/default/locale
+    else
+      sed -i 's/^LC_TIME=.*/LC_TIME=pl_PL.UTF-8/' /etc/default/locale
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+if [[ "${SET_NTP}" == "1" ]]; then
+  log "Konfiguracja NTP (timesyncd)"
+  printf 'Serwery NTP: %s\n' "${NTP_SERVERS[*]}"
+
+  # Upewnij sie ze systemd-timesyncd jest zainstalowany
+  if ! command -v timedatectl >/dev/null 2>&1; then
+    apt -y install systemd-timesyncd
+  fi
+
+  TIMESYNCD_CONF="/etc/systemd/timesyncd.conf.d/99-custom-ntp.conf"
+  mkdir -p "$(dirname "${TIMESYNCD_CONF}")"
+
+  NTP_LINE=$(printf '%s ' "${NTP_SERVERS[@]}" | sed 's/ $//')
+  # Pierwsze 2 (lub mniej jesli tylko fallback) jako NTP, reszta jako FallbackNTP
+  PRIMARY_NTP=()
+  FALLBACK_NTP=()
+  for idx in "${!NTP_SERVERS[@]}"; do
+    if [[ $idx -lt 2 ]]; then
+      PRIMARY_NTP+=("${NTP_SERVERS[$idx]}")
+    else
+      FALLBACK_NTP+=("${NTP_SERVERS[$idx]}")
+    fi
+  done
+
+  {
+    echo "[Time]"
+    echo "NTP=$(printf '%s ' "${PRIMARY_NTP[@]}" | sed 's/ $//')"
+    if [[ ${#FALLBACK_NTP[@]} -gt 0 ]]; then
+      echo "FallbackNTP=$(printf '%s ' "${FALLBACK_NTP[@]}" | sed 's/ $//')"
+    fi
+    echo "PollIntervalMinSec=32"
+    echo "PollIntervalMaxSec=2048"
+  } > "${TIMESYNCD_CONF}"
+  chmod 644 "${TIMESYNCD_CONF}"
+
+  cat "${TIMESYNCD_CONF}"
+
+  log "Wlaczanie i restart systemd-timesyncd"
+  systemctl enable --now systemd-timesyncd
+  systemctl restart systemd-timesyncd
+
+  # Wylacz ntpd/chrony jesli dzialaly (konflikt z timesyncd)
+  for svc in ntp chrony chronyd; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+      log "Zatrzymywanie konkurencyjnej uslugi NTP: $svc"
+      systemctl disable --now "$svc" || true
+    fi
+  done
+
+  # Wlacz synchronizacje przez timedatectl
+  timedatectl set-ntp true
+
+  log "Weryfikacja synchronizacji NTP (czekam maks. 30s)"
+  SYNC_OK=0
+  for attempt in {1..6}; do
+    sleep 5
+    STATUS=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo "no")
+    if [[ "${STATUS}" == "yes" ]]; then
+      SYNC_OK=1
+      break
+    fi
+    echo "  Proba ${attempt}/6 - NTPSynchronized=${STATUS}"
+  done
+
+  echo
+  if [[ "${SYNC_OK}" == "1" ]]; then
+    echo "[OK] NTP zsynchronizowany poprawnie."
+  else
+    echo "[WARN] NTP nie zsynchronizowal sie w ciagu 30s. Sprawdz polaczenie i serwery."
+  fi
+
+  log "Stan timesyncd"
+  timedatectl status
+  timedatectl show-timesync --all 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
 if [[ "${DISABLE_IPV6}" == "1" ]]; then
   log "Wykrywanie interfejsow z netplan get"
   mapfile -t IFACES < <(detect_ifaces_from_netplan)
@@ -156,7 +281,7 @@ if [[ "${DISABLE_IPV6}" == "1" ]]; then
     echo "Brak polecenia netplan - pomijam konfiguracje YAML"
   fi
 
-  log "Weryfikacja"
+  log "Weryfikacja IPv6"
   echo "all.disable_ipv6=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || true)"
   for i in "${IFACES[@]}"; do
     echo "${i}.disable_ipv6=$(cat /proc/sys/net/ipv6/conf/${i}/disable_ipv6 2>/dev/null || true)"
@@ -164,6 +289,7 @@ if [[ "${DISABLE_IPV6}" == "1" ]]; then
   ip -6 a || true
 fi
 
+# ---------------------------------------------------------------------------
 log "Koniec"
 if [[ "${REBOOT_AT_END}" == "1" ]]; then
   reboot
