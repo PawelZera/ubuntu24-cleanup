@@ -4,7 +4,7 @@ Inteligentny skrypt czyszczący Ubuntu 24.04 LTS przeznaczony dla **serwerów pr
 
 - wyłącza **automatyczne aktualizacje** (unattended-upgrades, apt-daily, needrestart)
 - wyłącza **cloud-init** (lub całkowicie go usuwa)
-- odepina i wyłącza usługi **Ubuntu Pro**
+- odpina i wyłącza usługi **Ubuntu Pro**
 - wyłącza **IPv6** przez sysctl + overlay Netplan (czyta interfejsy z `netplan get`)
 - konfiguruje **strefę czasową** i **NTP** (z polskimi serwerami GUM jako fallback)
 - czyści osierocone pakiety APT (`rc`)
