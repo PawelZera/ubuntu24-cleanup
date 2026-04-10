@@ -27,6 +27,7 @@ DETACH_UBUNTU_PRO="${DETACH_UBUNTU_PRO:-1}"
 DISABLE_IPV6="${DISABLE_IPV6:-1}"
 SET_TIMEZONE="${SET_TIMEZONE:-1}"
 SET_NTP="${SET_NTP:-1}"
+DISABLE_AUTO_UPGRADES="${DISABLE_AUTO_UPGRADES:-1}"
 REBOOT_AT_END="${REBOOT_AT_END:-0}"
 
 # Serwery NTP z argumentow + zawsze dodajemy 2 awaryjne GUM
@@ -126,6 +127,59 @@ if command -v pro >/dev/null 2>&1; then
   fi
 else
   log "Polecenie 'pro' nie jest dostepne - pomijam Ubuntu Pro"
+fi
+
+# ---------------------------------------------------------------------------
+if [[ "${DISABLE_AUTO_UPGRADES}" == "1" ]]; then
+  log "Wylaczanie automatycznych aktualizacji (unattended-upgrades)"
+
+  # 1. Zatrzymaj i wylacz uslugi
+  systemctl disable --now unattended-upgrades.service 2>/dev/null || true
+  systemctl disable --now apt-daily.timer 2>/dev/null || true
+  systemctl disable --now apt-daily-upgrade.timer 2>/dev/null || true
+
+  # 2. Maskuj jednostki apt-daily aby nie mogly byc uruchamiane przez zaleznosci
+  systemctl mask apt-daily.service 2>/dev/null || true
+  systemctl mask apt-daily-upgrade.service 2>/dev/null || true
+
+  # 3. Ustaw APT::Periodic na 0 - blokada na poziomie konfiguracji APT
+  cat > /etc/apt/apt.conf.d/20auto-upgrades <<'APTCONF'
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Download-Upgradeable-Packages "0";
+APT::Periodic::AutocleanInterval "0";
+APT::Periodic::Unattended-Upgrade "0";
+APTCONF
+  chmod 644 /etc/apt/apt.conf.d/20auto-upgrades
+
+  # 4. Wylacz needrestart (restartuje uslugi po aktualizacji bibliotek)
+  if dpkg -l needrestart >/dev/null 2>&1; then
+    log "Konfiguracja needrestart - tryb informacyjny (bez automatycznych restartow)"
+    mkdir -p /etc/needrestart/conf.d
+    cat > /etc/needrestart/conf.d/99-no-autorestart.conf <<'NRCONF'
+# Tryb: l=lista (tylko informacja), i=interaktywny, a=automatyczny
+$nrconf{restart} = 'l';
+NRCONF
+    chmod 644 /etc/needrestart/conf.d/99-no-autorestart.conf
+    echo "needrestart: ustawiono tryb 'l' (tylko raport, bez automatycznych restartow)"
+  fi
+
+  # 5. Weryfikacja stanu
+  echo ""
+  echo "--- Weryfikacja wylaczenia autoaktualizacji ---"
+  systemctl is-enabled unattended-upgrades.service 2>/dev/null \
+    && echo "[WARN] unattended-upgrades: aktywny (sprawdz recznie)" \
+    || echo "[ OK] unattended-upgrades.service: disabled/masked"
+  systemctl is-enabled apt-daily.timer 2>/dev/null \
+    && echo "[WARN] apt-daily.timer: aktywny" \
+    || echo "[ OK] apt-daily.timer: disabled"
+  systemctl is-enabled apt-daily-upgrade.timer 2>/dev/null \
+    && echo "[WARN] apt-daily-upgrade.timer: aktywny" \
+    || echo "[ OK] apt-daily-upgrade.timer: disabled"
+  echo "[ OK] /etc/apt/apt.conf.d/20auto-upgrades - zawartosc:"
+  cat /etc/apt/apt.conf.d/20auto-upgrades
+  echo ""
+  echo "UWAGA: Serwer nie bedzie sie sam aktualizowac."
+  echo "       Pamietaj o recznie wykonywanym: apt update && apt upgrade"
 fi
 
 # ---------------------------------------------------------------------------
