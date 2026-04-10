@@ -38,8 +38,7 @@ curl -fsSL https://raw.githubusercontent.com/PawelZera/ubuntu24-cleanup/main/ins
 
 ## Wyłączanie automatycznych aktualizacji
 
-Na serwerach produkcyjnych automatyczne aktualizacje mogą nieoczekiwanie restartować usługi
-(np. MySQL, Apache, Zabbix) w trakcie nocnego okna serwisowego `unattended-upgrades`.
+Na serwerach produkcyjnych automatyczne aktualizacje mogą nieoczekiwanie restartować usługi w trakcie nocnego okna serwisowego `unattended-upgrades`.
 Sekcja `DISABLE_AUTO_UPGRADES` blokuje ten mechanizm kompleksowo na czterech poziomach:
 
 1. **systemd** — `disable --now` dla `unattended-upgrades.service`, `apt-daily.timer`, `apt-daily-upgrade.timer`
